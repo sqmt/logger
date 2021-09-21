@@ -2,7 +2,6 @@ package logger
 
 import (
     "fmt"
-    "os"
     "strings"
     "time"
 
@@ -10,90 +9,197 @@ import (
     "go.uber.org/zap/zapcore"
 )
 
-var writers map[string]Writer
+var (
+    defaultOption = &Option{
+        Output:        []*Output{{Writer: "console"}},
+        Name:          "",
+        Level:         "info",
+        Format:        "",
+        ShowLine:      false,
+        MessageKey:    "message",
+        LevelKey:      "level",
+        TimeKey:       "time",
+        NameKey:       "name",
+        CallerKey:     "caller",
+        FunctionKey:   "function",
+        StacktraceKey: "stacktrace",
+        LineEnding:    zapcore.DefaultLineEnding,
+        LevelEncoder:  "lower",
+        TimeFormat:    "2006/01/02 15:04:05.000",
+    }
+    writers = map[string]Writer{
+        "console": writerConsole,
+        "file":    writerFile,
+    }
+)
+
+type Output struct {
+    Writer        string                 `json:"writer" yaml:"writer"`
+    Level         string                 `json:"level" yaml:"level"`
+    Format        string                 `json:"format" yaml:"format"`
+    MessageKey    string                 `json:"messageKey" yaml:"messageKey"`
+    LevelKey      string                 `json:"levelKey" yaml:"levelKey"`
+    TimeKey       string                 `json:"timeKey" yaml:"timeKey"`
+    NameKey       string                 `json:"nameKey" yaml:"nameKey"`
+    CallerKey     string                 `json:"callerKey" yaml:"callerKey"`
+    FunctionKey   string                 `json:"functionKey" yaml:"functionKey"`
+    StacktraceKey string                 `json:"stacktraceKey" yaml:"stacktraceKey"`
+    LineEnding    string                 `json:"lineEnding" yaml:"lineEnding"`
+    LevelEncoder  string                 `json:"levelEncoder" yaml:"levelEncoder"` // capital, capitalColor, color, lower(default)
+    TimeFormat    string                 `json:"timeFormat" yaml:"timeFormat"`
+    Option        map[string]interface{} `json:"option" yaml:"option"`
+}
+
+type Option struct {
+    Output         []*Output `mapstructure:"output" json:"output" yaml:"output"`
+    Name           string    `json:"name" yaml:"name"`
+    ShowLine       bool      `json:"showLine" yaml:"showLine"`
+    ShowStacktrace bool      `json:"ShowStacktrace" yaml:"ShowStacktrace"`
+    // 公共配置
+    Level string `json:"level" yaml:"level"`
+    // Color         bool   `json:"color" yaml:"color"`
+    Format        string `json:"format" yaml:"format"`
+    MessageKey    string `json:"messageKey" yaml:"messageKey"`
+    LevelKey      string `json:"levelKey" yaml:"levelKey"`
+    TimeKey       string `json:"timeKey" yaml:"timeKey"`
+    NameKey       string `json:"nameKey" yaml:"nameKey"`
+    CallerKey     string `json:"callerKey" yaml:"callerKey"`
+    FunctionKey   string `json:"functionKey" yaml:"functionKey"`
+    StacktraceKey string `json:"stacktraceKey" yaml:"stacktraceKey"`
+    LineEnding    string `json:"lineEnding" yaml:"lineEnding"`
+    LevelEncoder  string `json:"levelEncoder" yaml:"levelEncoder"` // capital,capitalColor, lower(default), lowerColor
+    TimeFormat    string `json:"timeFormat" yaml:"timeFormat"`
+}
 
 type Writer func(option map[string]interface{}) (zapcore.WriteSyncer, error)
 
-type Option struct {
-    Writer        string                 `json:"writer" yaml:"writer"`
-    Console       bool                   `json:"console" yaml:"console"`
-    Level         string                 `json:"level" yaml:"level"`
-    Format        string                 `json:"format" yaml:"format"` // json text
-    ShowLine      bool                   `json:"showLine" yaml:"showLine"`
-    WriterOptions map[string]interface{} `json:"writerOptions" yaml:"writerOptions"`
-
-    // Encoder
-    MessageKey       string `json:"messageKey" yaml:"messageKey"`
-    LevelKey         string `json:"levelKey" yaml:"levelKey"`
-    TimeKey          string `json:"timeKey" yaml:"timeKey"`
-    NameKey          string `json:"nameKey" yaml:"nameKey"`
-    CallerKey        string `json:"callerKey" yaml:"callerKey"`
-    FunctionKey      string `json:"functionKey" yaml:"functionKey"`
-    StacktraceKey    string `json:"stacktraceKey" yaml:"stacktraceKey"`
-    LineEnding       string `json:"lineEnding" yaml:"lineEnding"`
-    LevelEncoder     string `json:"levelEncoder" yaml:"levelEncoder"` // capital, capitalColor, color, lower(default)
-    EncodeTimeFormat string `json:"encodeTimeFormat" yaml:"encodeTimeFormat"`
-    ColorOnlyConsole bool   `json:"colorOnlyConsole" yaml:"colorOnlyConsole"`
-}
-
-func init() {
-    SetWriter("file", fileWriteSyncer)
-}
-
-func SetWriter(key string, f Writer) {
-    if writers == nil {
-        writers = map[string]Writer{}
+// New 返回zap.Logger
+func New(opts ...*Option) (*zap.Logger, error) {
+    o := defaultOption
+    if len(opts) > 0 {
+        o = opts[0]
     }
-    writers[key] = f
-}
-
-func defaultOption() *Option {
-    return &Option{
-        Console:          true,
-        Level:            "info",
-        MessageKey:       "message",
-        LevelKey:         "level",
-        TimeKey:          "time",
-        NameKey:          "logger",
-        CallerKey:        "caller",
-        FunctionKey:      "function",
-        StacktraceKey:    "stack",
-        LineEnding:       zapcore.DefaultLineEnding,
-        EncodeTimeFormat: "2006/01/02 15:04:05.000",
+    optionSet(o)
+    level := convertLevelStr(o.Level)
+    cores := make([]zapcore.Core, 0)
+    for _, output := range o.Output {
+        if core, l, err := newOutput(o, output); core != nil {
+            cores = append(cores, core)
+            if l == zapcore.DebugLevel || l == zapcore.ErrorLevel {
+                level = l
+            }
+        } else {
+            return nil, err
+        }
     }
+    zapLogger := zap.New(zapcore.NewTee(cores...))
+    if level == zapcore.DebugLevel || level == zapcore.ErrorLevel {
+        zapLogger = zapLogger.WithOptions(zap.AddStacktrace(level))
+    }
+    if o.ShowLine {
+        zapLogger = zapLogger.WithOptions(zap.AddCaller())
+    }
+    return zapLogger.Named(o.Name), nil
 }
 
-func getOption(o *Option) *Option {
+// newOutput 创建一个zapcore.Core
+func newOutput(o *Option, output *Output) (zapcore.Core, zapcore.Level, error) {
+    f, ok := writers[output.Writer]
+    if !ok {
+        return nil, zapcore.InfoLevel, fmt.Errorf("writer %s not support", output.Writer)
+    }
+    outputOptionSet(o, output)
+    writer, err := f(output.Option)
+    if err != nil {
+        return nil, zapcore.InfoLevel, err
+    }
+    level := convertLevelStr(output.Level)
+    enc := getZapCoreEncoder(output)
+
+    return zapcore.NewCore(enc, writer, level), level, nil
+}
+
+// optionSet 设置option默认值
+func optionSet(o *Option) {
+    if len(o.Output) == 0 {
+        o.Output = defaultOption.Output
+    }
+    if o.Level == "" {
+        o.Level = defaultOption.Level
+    }
     if o.MessageKey == "" {
-        o.MessageKey = "message"
+        o.MessageKey = defaultOption.MessageKey
     }
     if o.LevelKey == "" {
-        o.LevelKey = "level"
+        o.LevelKey = defaultOption.LevelKey
     }
     if o.TimeKey == "" {
-        o.TimeKey = "time"
+        o.TimeKey = defaultOption.TimeKey
     }
     if o.NameKey == "" {
-        o.NameKey = "logger"
+        o.NameKey = defaultOption.NameKey
     }
     if o.CallerKey == "" {
-        o.CallerKey = "caller"
+        o.CallerKey = defaultOption.CallerKey
     }
     if o.FunctionKey == "" {
-        o.FunctionKey = "function"
+        o.FunctionKey = defaultOption.FunctionKey
     }
     if o.StacktraceKey == "" {
-        o.StacktraceKey = "stack"
+        o.StacktraceKey = defaultOption.StacktraceKey
     }
     if o.LineEnding == "" {
-        o.LineEnding = zapcore.DefaultLineEnding
+        o.LineEnding = defaultOption.LineEnding
     }
-    if o.EncodeTimeFormat == "" {
-        o.EncodeTimeFormat = "2006/01/02 15:04:05.000"
+    if o.LevelEncoder == "" {
+        o.LevelEncoder = defaultOption.LevelEncoder
     }
-    return o
+    if o.TimeFormat == "" {
+        o.TimeFormat = defaultOption.TimeFormat
+    }
 }
 
+// outputOptionSet 输出配置
+func outputOptionSet(o *Option, opt *Output) {
+    if opt.Level == "" {
+        opt.Level = o.Level
+    }
+    if opt.Format == "" {
+        opt.Format = o.Format
+    }
+    if opt.MessageKey == "" {
+        opt.MessageKey = o.MessageKey
+    }
+    if opt.LevelKey == "" {
+        opt.LevelKey = o.LevelKey
+    }
+    if opt.TimeKey == "" {
+        opt.TimeKey = o.TimeKey
+    }
+    if opt.NameKey == "" {
+        opt.NameKey = o.NameKey
+    }
+    if opt.CallerKey == "" {
+        opt.CallerKey = o.CallerKey
+    }
+    if opt.FunctionKey == "" {
+        opt.FunctionKey = o.FunctionKey
+    }
+    if opt.StacktraceKey == "" {
+        opt.StacktraceKey = o.StacktraceKey
+    }
+    if opt.LineEnding == "" {
+        opt.LineEnding = o.LineEnding
+    }
+    if opt.LevelEncoder == "" {
+        opt.LevelEncoder = o.LevelEncoder
+    }
+    if opt.TimeFormat == "" {
+        opt.TimeFormat = o.TimeFormat
+    }
+}
+
+// convertLevelStr 转换level值
 func convertLevelStr(level string) zapcore.Level {
     switch strings.ToLower(level) {
     case "debug":
@@ -104,7 +210,7 @@ func convertLevelStr(level string) zapcore.Level {
         return zapcore.WarnLevel
     case "error":
         return zapcore.ErrorLevel
-    case "dpanic", "d-panic", "d_panic":
+    case "dpanic":
         return zapcore.DPanicLevel
     case "panic":
         return zapcore.PanicLevel
@@ -113,99 +219,41 @@ func convertLevelStr(level string) zapcore.Level {
     }
 }
 
-// New returns a new logger management object.
-func New(option ...*Option) *zap.Logger {
-    o := defaultOption()
-    if len(option) > 0 && option[0] != nil {
-        o = getOption(option[0])
-    }
-
-    return NewWithOption(o)
-}
-
-// NewWithOption returns a new logger management object.
-func NewWithOption(option *Option) *zap.Logger {
-    o := getOption(option)
-    level := convertLevelStr(o.Level)
-
-    return newZapLogger(option, level)
-}
-
-func getZapCoreEncoderConfig(option *Option) zapcore.EncoderConfig {
+// getZapCoreEncoderConfig 获取zapcore.EncoderConfig配置
+func getZapCoreEncoderConfig(o *Output) zapcore.EncoderConfig {
     config := zapcore.EncoderConfig{
-        MessageKey:     option.MessageKey,
-        LevelKey:       option.LevelKey,
-        TimeKey:        option.TimeKey,
-        NameKey:        option.NameKey,
-        CallerKey:      option.CallerKey,
-        LineEnding:     option.LineEnding,
+        MessageKey:     o.MessageKey,
+        LevelKey:       o.LevelKey,
+        TimeKey:        o.TimeKey,
+        NameKey:        o.NameKey,
+        CallerKey:      o.CallerKey,
+        LineEnding:     o.LineEnding,
         EncodeDuration: zapcore.SecondsDurationEncoder,
         EncodeCaller:   zapcore.FullCallerEncoder,
     }
-    switch option.LevelEncoder {
+    switch o.LevelEncoder {
     case "capital":
         config.EncodeLevel = zapcore.CapitalLevelEncoder
-    case "capitalColor", "capitalcolor", "capital-color", "capital_color":
+    case "capitalColor":
         config.EncodeLevel = zapcore.CapitalColorLevelEncoder
-    case "color":
+    case "lowerColor":
         config.EncodeLevel = zapcore.LowercaseColorLevelEncoder
     default:
         config.EncodeLevel = zapcore.LowercaseLevelEncoder
     }
-    if option.EncodeTimeFormat != "" {
+    if o.TimeFormat != "" {
         config.EncodeTime = func(time time.Time, encoder zapcore.PrimitiveArrayEncoder) {
-            encoder.AppendString(time.Format(option.EncodeTimeFormat))
+            encoder.AppendString(time.Format(o.TimeFormat))
         }
     }
 
     return config
 }
 
-func getZapCoreEncoder(option *Option) zapcore.Encoder {
-    if strings.ToLower(option.Format) == "json" {
-        return zapcore.NewJSONEncoder(getZapCoreEncoderConfig(option))
+// getZapCoreEncoder 获取 zapcore.Encoder
+func getZapCoreEncoder(o *Output) zapcore.Encoder {
+    if strings.ToLower(o.Format) == "json" {
+        return zapcore.NewJSONEncoder(getZapCoreEncoderConfig(o))
     }
-    return zapcore.NewConsoleEncoder(getZapCoreEncoderConfig(option))
-}
-
-func newZapLogger(option *Option, level zapcore.Level) *zap.Logger {
-    var (
-        writer zapcore.WriteSyncer
-        err    error
-        core   zapcore.Core
-    )
-    if f, ok := writers[strings.ToLower(option.Writer)]; ok {
-        writer, err = f(option.WriterOptions)
-    } else {
-        err = fmt.Errorf("not support writer: %s", option.Writer)
-    }
-    if err != nil {
-        fmt.Println("get WriterSyncer failed", err)
-    }
-    core = newTee(option, level, writer)
-    zapLogger := zap.New(core)
-    if level == zapcore.DebugLevel || level == zapcore.ErrorLevel {
-        zapLogger = zapLogger.WithOptions(zap.AddStacktrace(level))
-    }
-    if option.ShowLine {
-        zapLogger = zapLogger.WithOptions(zap.AddCaller())
-    }
-
-    return zapLogger
-}
-
-func newTee(option *Option, level zapcore.Level, writer zapcore.WriteSyncer) zapcore.Core {
-    cores := make([]zapcore.Core, 0)
-    encoder := getZapCoreEncoder(option)
-    if writer == nil || option.Console {
-        cores = append(cores, zapcore.NewCore(encoder, zapcore.AddSync(os.Stdout), level))
-    }
-    if writer != nil {
-        if option.ColorOnlyConsole && strings.Contains(strings.ToLower(option.LevelEncoder), "color") {
-            option.LevelEncoder = strings.ReplaceAll(strings.ToLower(option.LevelEncoder), "color", "")
-            encoder = getZapCoreEncoder(option)
-        }
-        cores = append(cores, zapcore.NewCore(encoder, writer, level))
-    }
-    return zapcore.NewTee(cores...)
+    return zapcore.NewConsoleEncoder(getZapCoreEncoderConfig(o))
 }
